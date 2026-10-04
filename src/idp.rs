@@ -678,7 +678,7 @@ pub struct IssueResponse<'a> {
     pub holder_of_key_cert: Option<&'a crate::crypto::cert::X509Certificate>,
 }
 
-/// Inputs for [`IdentityProvider::issue_unsolicited`]. See RFC-004 §3.2.
+/// Inputs for POST-only [`IdentityProvider::issue_unsolicited`]. See RFC-004 §3.2.
 ///
 /// Mirrors [`IssueResponse`] except that the ACS endpoint and the NameID
 /// format are named directly: there is no `<samlp:AuthnRequest>` to resolve
@@ -686,7 +686,7 @@ pub struct IssueResponse<'a> {
 pub struct IssueUnsolicited<'a> {
     pub sp: &'a SpDescriptor,
     /// ACS URL to deliver to. MUST appear in `sp`'s descriptor, otherwise
-    /// [`Error::UnregisteredAcs`].
+    /// [`Error::UnregisteredAcs`]. Only HTTP-POST is supported.
     pub acs_url: &'a str,
     pub name_id: NameId,
     pub attributes: Vec<Attribute>,
@@ -697,6 +697,7 @@ pub struct IssueUnsolicited<'a> {
     /// Format to request for the outbound `NameID`, resolved against the
     /// IdP's supported formats exactly as a solicited Response resolves the
     /// SP's requested format. `None` uses `default_name_id_format`.
+    /// The supplied `name_id` must already use the resolved format; it is not relabeled.
     pub requested_name_id_format: Option<NameIdFormat>,
     /// RelayState to echo into the binding. For IdP-initiated SSO this is
     /// where a deep link to the intended resource travels.
@@ -862,14 +863,17 @@ impl IdentityProvider {
         )
     }
 
-    /// Mint and binding-encode an unsolicited `<samlp:Response>` — one no
+    /// Mint and POST-encode an unsolicited `<samlp:Response>` — one no
     /// `<samlp:AuthnRequest>` asked for. See RFC-004 §3.2.
     ///
     /// SAML 2.0 Profiles §4.1.5 permits an IdP to deliver an assertion with no
     /// preceding request; this is IdP-initiated SSO. [`ServiceProvider`] has
     /// always been able to consume one via
     /// [`ServiceProviderConfig::allow_unsolicited`], and this is the other
-    /// half.
+    /// half. HTTP-Artifact is rejected: unsolicited issuance has no API to
+    /// return the trust transaction required for authenticated artifact resolution.
+    /// With `artifact-binding`, this returns [`Error::ArtifactTransactionRequired`];
+    /// without it, [`Error::UnsupportedByPeer`].
     ///
     /// The emitted `<samlp:Response>` and its
     /// `<saml:SubjectConfirmationData>` carry no `@InResponseTo`, there being
@@ -895,13 +899,17 @@ impl IdentityProvider {
                 entity_id: input.sp.entity_id.clone(),
             })?;
 
+        if acs_endpoint.binding == SsoResponseBinding::HttpArtifact {
+            return Err(artifact_issuance_without_transaction_error());
+        }
+
         let chosen_format = pick_name_id_format(
             input.requested_name_id_format.as_ref(),
             &self.config.supported_name_id_formats,
             &self.config.default_name_id_format,
-        );
-        let mut name_id = input.name_id;
-        name_id.format = chosen_format;
+        )?;
+        let name_id = input.name_id;
+        ensure_name_id_format(&name_id, &chosen_format)?;
 
         let inputs = IssueResponseInputs {
             sp: input.sp,
@@ -929,6 +937,7 @@ impl IdentityProvider {
             #[cfg(feature = "xmlenc")]
             outbound_key_transport_algorithm: self.config.outbound_key_transport_algorithm,
             acs_endpoint,
+            artifact_resolution_service: None,
             relay_state: input.relay_state,
             holder_of_key_cert: input.holder_of_key_cert,
         };
@@ -3802,7 +3811,7 @@ mod tests {
             session_index: "sess-unsolicited".into(),
             session_not_on_or_after: fixed_now().checked_add(Duration::from_hours(1)),
             authn_context_class_ref: AuthnContextClassRef::PasswordProtectedTransport,
-            requested_name_id_format: None,
+            requested_name_id_format: Some(NameIdFormat::EmailAddress),
             relay_state: Some("deep-link"),
             force_encrypt_assertion: Some(false),
             now: fixed_now(),
@@ -3950,12 +3959,73 @@ mod tests {
     }
 
     #[test]
+    fn issue_unsolicited_rejects_name_id_format_mismatch() {
+        let idp = idp_with(false, false);
+        let sp = sp_descriptor(false);
+        let mut input = issue_unsolicited_fixture(&sp, "https://sp.example.com/acs");
+        input.requested_name_id_format = Some(NameIdFormat::Persistent);
+        assert!(matches!(
+            idp.issue_unsolicited(input),
+            Err(Error::NameIdFormatMismatch { expected, got })
+                if expected == NameIdFormat::Persistent.as_uri()
+                    && got == NameIdFormat::EmailAddress.as_uri()
+        ));
+    }
+
+    #[test]
+    fn issue_unsolicited_rejects_default_name_id_format_mismatch() {
+        let idp = idp_with(false, false);
+        let sp = sp_descriptor(false);
+        let mut input = issue_unsolicited_fixture(&sp, "https://sp.example.com/acs");
+        input.requested_name_id_format = None;
+        assert!(matches!(
+            idp.issue_unsolicited(input),
+            Err(Error::NameIdFormatMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn issue_unsolicited_rejects_unsupported_name_id_format() {
+        let idp = idp_with(false, false);
+        let sp = sp_descriptor(false);
+        let mut input = issue_unsolicited_fixture(&sp, "https://sp.example.com/acs");
+        input.requested_name_id_format = Some(NameIdFormat::Transient);
+        assert!(matches!(
+            idp.issue_unsolicited(input),
+            Err(Error::UnsupportedNameIdPolicy { requested })
+                if requested == NameIdFormat::Transient.as_uri()
+        ));
+    }
+
+    #[test]
+    fn issue_unsolicited_rejects_artifact_acs() {
+        let idp = idp_with(false, false);
+        let mut sp = sp_descriptor(false);
+        for endpoint in &mut sp.assertion_consumer_services {
+            endpoint.binding = SsoResponseBinding::HttpArtifact;
+        }
+        let err = idp
+            .issue_unsolicited(issue_unsolicited_fixture(&sp, "https://sp.example.com/acs"))
+            .expect_err("unsolicited Artifact needs a transaction-bearing API");
+        #[cfg(feature = "artifact-binding")]
+        assert!(matches!(err, Error::ArtifactTransactionRequired));
+        #[cfg(not(feature = "artifact-binding"))]
+        assert!(matches!(
+            err,
+            Error::UnsupportedByPeer {
+                binding: Binding::HttpArtifact
+            }
+        ));
+    }
+
+    #[test]
     fn issue_unsolicited_honors_the_requested_name_id_format() {
         let idp = idp_with(false, false);
         let sp = sp_descriptor(false);
 
         let mut input = issue_unsolicited_fixture(&sp, "https://sp.example.com/acs");
         input.requested_name_id_format = Some(NameIdFormat::Persistent);
+        input.name_id = NameId::persistent_for_sp("opaque-pairwise-subject", &sp.entity_id);
         let dispatch = idp.issue_unsolicited(input).expect("issue ok");
 
         let form = match dispatch {
@@ -3967,6 +4037,7 @@ mod tests {
         let decoded = crate::binding::post::decode(&form.saml_response, None).unwrap();
         let xml = String::from_utf8(decoded.xml).expect("utf-8");
         assert!(xml.contains(NameIdFormat::Persistent.as_uri()));
+        assert!(xml.contains(">opaque-pairwise-subject</"));
     }
 
     #[test]

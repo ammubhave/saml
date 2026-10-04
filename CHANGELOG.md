@@ -15,7 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `allow_unsolicited`; this is the other half. The emitted Response and its
   `SubjectConfirmationData` carry no `InResponseTo`, since a relying party
   rejects one it did not issue. The ACS is nominated by URL and checked
-  against the SP descriptor.
+  against the SP descriptor. Unsolicited issuance supports HTTP-POST only;
+  HTTP-Artifact is rejected until a transaction-bearing unsolicited API exists.
+  Unsupported NameID formats and supplied identifiers with a mismatched
+  format are rejected rather than relabeled.
 
 ### Changed
 
