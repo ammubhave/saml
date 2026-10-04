@@ -431,13 +431,14 @@ mod tests {
     fn rsa_key_with_cert() -> KeyPair {
         let kp = KeyPair::from_pkcs8_pem(RSA_KEY_PKCS8_PEM).unwrap();
         let cert = X509Certificate::from_pem(RSA_CERT_PEM).unwrap();
-        kp.with_certificate(cert)
+        kp.with_certificate(cert).expect("matching RSA certificate")
     }
 
     fn ecdsa_key_with_cert() -> KeyPair {
         let kp = KeyPair::from_pkcs8_pem(EC_P256_KEY_PKCS8_PEM).unwrap();
         let cert = X509Certificate::from_pem(EC_P256_CERT_PEM).unwrap();
         kp.with_certificate(cert)
+            .expect("matching ECDSA certificate")
     }
 
     /// Locate the first `<ds:Signature>` child of `element`.
@@ -528,7 +529,7 @@ mod tests {
         let x509_cert = x509_data
             .child_element(Some(DSIG_NS), "X509Certificate")
             .expect("X509Certificate present");
-        assert!(!x509_cert.text_content().is_empty());
+        assert_ne!(x509_cert.text_content(), "");
     }
 
     #[test]

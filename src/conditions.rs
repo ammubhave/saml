@@ -22,8 +22,8 @@ pub struct Conditions {
     /// values. Audiences within one group are alternatives (OR), while all
     /// groups must be satisfied (AND) per SAML Core section 2.5.1.4.
     pub audience_restrictions: Vec<Vec<String>>,
-    /// `<saml:OneTimeUse>` was present. The caller is expected to enforce
-    /// single-use semantics by deduping on `assertion_id`.
+    /// `<saml:OneTimeUse>` was present. The SP role enforces single-use via
+    /// its configured atomic replay cache and fails closed without one.
     pub one_time_use: bool,
     /// `<saml:ProxyRestriction Count="…">` value.
     pub proxy_restriction_count: Option<u32>,
@@ -58,7 +58,7 @@ mod tests {
         );
         assert!(!c.one_time_use);
         assert!(c.proxy_restriction_count.is_none());
-        assert!(c.proxy_restriction_audiences.is_empty());
+        assert_eq!(c.proxy_restriction_audiences, Vec::<String>::new());
     }
 
     #[test]
@@ -82,7 +82,7 @@ mod tests {
         c.one_time_use = true;
         c.audience_restrictions.clear();
         assert!(c.one_time_use);
-        assert!(c.audience_restrictions.is_empty());
+        assert_eq!(c.audience_restrictions, Vec::<Vec<String>>::new());
     }
 
     #[test]
